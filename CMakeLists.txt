@@ -71,20 +71,11 @@ endif()
 add_subdirectory(third_party/iree EXCLUDE_FROM_ALL)
 
 #-------------------------------------------------------------------------------
-# Application
+# Repro
 #-------------------------------------------------------------------------------
-# This is the runtime/src/iree/runtime/demo/ source copied here to show a basic
-# command line application that can load a compiled IREE module and pass in
-# buffers. Usage of the runtime APIs is documented in the main IREE repository.
 
-set(_NAME "hello_world")
-add_executable(${_NAME} "hello_world.c")
-
-# TODO(benvanik): make iree_status_annotate_f always available as a function
-# instead of defining it empty? otherwise optimized builds of the runtime won't
-# export it but external libraries may pull it in.
+set(_NAME "low_level_multi_instance_hal_repro")
+add_executable(${_NAME} "low_level_multi_instance_hal_repro.c")
 target_compile_options(${_NAME} PRIVATE ${IREE_DEFAULT_COPTS})
-
-# Link in the IREE runtime library.
-# This will pull in dependencies based on the configuration options above.
-target_link_libraries(${_NAME} iree_runtime_runtime)
+find_package(Threads REQUIRED)
+target_link_libraries(${_NAME} iree_runtime_runtime Threads::Threads)

@@ -4,6 +4,7 @@
 # CMake artifacts
 build/
 build-*/
+.cache/
 
 # Local-only config options
 version_info.json

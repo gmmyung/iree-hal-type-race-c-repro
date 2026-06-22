@@ -1,93 +1,117 @@
-# IREE Runtime Hello World with CMake
+# IREE HAL VM Ref Type Race Repro
 
-[![Build with Latest IREE Release](https://github.com/iree-org/iree-template-runtime-cmake/actions/workflows/build-and-test.yml/badge.svg?query=branch%3Amain+event%3Apush)](https://github.com/iree-org/iree-template-runtime-cmake/actions/workflows/build-and-test.yml?query=branch%3Amain+event%3Apush)
+This is a small C repro based on
+[`iree-template-runtime-cmake`](https://github.com/iree-org/iree-template-runtime-cmake).
 
-## Instructions
+It stress tests concurrent creation and use of independent low-level IREE
+runtime stacks:
 
-### Cloning the Repository
+1. each thread creates its own `iree_vm_instance_t`
+2. each instance calls `iree_hal_module_register_all_types(instance)`
+3. each thread creates its own HAL device, HAL module, bytecode module, VM
+   context, and function handle
+4. all threads invoke the same exported VM function repeatedly
 
-Use GitHub's "Use this template" feature to create a new repository or clone it
-manually:
+No `iree_vm_context_t` or `iree_runtime_session_t` is shared across threads.
 
-```sh
-$ git clone https://github.com/iree-org/iree-template-runtime-cmake.git
-$ cd iree-template-runtime-cmake
-$ git submodule update --init --recursive
+## Why This Looks Supported
+
+The repro follows the low-level setup pattern used by
+`samples/simple_embedding/simple_embedding.c`:
+
+```c
+iree_vm_instance_create(..., &instance);
+iree_hal_module_register_all_types(instance);
+iree_hal_module_create(..., &hal_module);
+iree_vm_bytecode_module_create(..., &bytecode_module);
+iree_vm_context_create_with_modules(..., &context);
+iree_vm_invoke(...);
 ```
 
-The only requirement is that the main IREE repository is added as a submodule.
-If working in an existing repository then add the submodule and ensure it has
-its submodules initialized:
+Relevant API comments in IREE `v3.11.0`:
+
+- `iree_vm_instance_t` is documented as `Thread-safe`.
+- `iree_runtime_instance_t` is documented as `Thread-safe` and describes
+  separate instances as useful for multi-tenant isolation.
+- `iree_runtime_session_t` and `iree_vm_context_t` are only
+  thread-compatible, but this repro does not share either object between
+  threads.
+
+## Build
 
 ```sh
-$ git submodule add https://github.com/iree-org/iree.git third_party/iree/
-$ git submodule update --init --recursive
+git submodule update --init --recursive third_party/iree
+
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo .
+cmake --build build --target low_level_multi_instance_hal_repro
 ```
 
-For a faster checkout some compiler-only dependencies can be dropped as this
-template is only compiling the runtime (only bother if optimizing build bots):
+Compile the sample module with a matching IREE compiler:
 
 ```sh
-$ git \
-    -c submodule."third_party/llvm-project".update=none \
-    -c submodule."third_party/stablehlo".update=none \
-    -c submodule."third_party/torch-mlir".update=none \
-    submodule update --init --recursive
-```
-
-### Building the Runtime
-
-The [CMakeLists.txt](./CMakeLists.txt) adds the IREE CMake files as a subproject
-and configures it for runtime-only compilation. A project wanting to build the
-compiler from source or include other HAL drivers (CUDA, Vulkan, multi-threaded
-CPU, etc) can change which options they set before they `add_subdirectory` on
-the IREE project and/or pass the configuration to the CMake configure command.
-
-The sample currently compiles in the synchronous CPU HAL driver (`local-sync`).
-
-```sh
-$ cmake -B build/ -G Ninja .
-$ cmake --build build/ --target hello_world
-```
-
-### Compiling the Sample Module
-
-This sample assumes that a compatible IREE compiler release is installed and
-used to compile the module. For many users upgrading their `iree-compiler`
-install when they bump their submodule should be sufficient to ensure the
-compiler and runtime are compatible. In the future the compiler and runtime
-will have more support for version shifting.
-
-The sample currently assumes a CPU HAL driver and only produces a VMFB
-supporting that. Additional compiler options can be used to change the target
-HAL driver, target device architecture, etc. IREE supports multi-targeting both
-across device types (CPU/GPU/etc) and architectures (AArch64/x86-64/etc) but the
-command line interfaces are still under development. Basic CPU cross-compiling
-can be accomplished with the `--iree-llvm-target-triple=` flag specifying the
-CPU architecture.
-
-```sh
-$ python -m pip install iree-compiler==20240828.999 --upgrade --user
-$ iree-compile \
+iree-compile \
     --iree-hal-target-backends=llvm-cpu \
-    --iree-llvmcpu-target-triple=x86_64 \
     simple_mul.mlir \
     -o build/simple_mul.vmfb
 ```
 
-### Running the Sample
+## Run
 
-The included sample program takes the device URI (in this case `local-sync`) and
-compiled module file (`simple_mul.vmfb` as output from above) and prints the
-output of a simple calculation. More advanced features like asynchronous
-execution, providing output storage buffers for results, and stateful programs
-are covered in other IREE samples.
+Low thread counts usually pass:
 
 ```sh
-$ ./build/hello_world local-sync build/simple_mul.vmfb
-4xf32=1 1.1 1.2 1.3
- *
-4xf32=10 100 1000 10000
- =
-4xf32=10 110 1200 13000
+./build/low_level_multi_instance_hal_repro \
+    local-sync build/simple_mul.vmfb 1000 8
 ```
+
+Example output:
+
+```text
+completed 1000 low-level calls on each of 8 threads
+```
+
+Higher thread counts reproduce intermittent failures on my machine. This failed
+on run 4 of the loop below:
+
+```sh
+for i in $(seq 1 20); do
+  echo "run=$i"
+  ./build/low_level_multi_instance_hal_repro \
+      local-sync build/simple_mul.vmfb 1000 128 || exit $?
+done
+```
+
+Observed failures:
+
+```text
+run=4
+thread 78 failed:
+iree/runtime/src/iree/vm/ref.h:223: INVALID_ARGUMENT; ref is null; while invoking native function hal.command_buffer.dispatch; while calling import;
+[ 1] bytecode module.__init:184 -
+[ 0] bytecode module@2:1012 -
+thread 100 failed:
+iree/runtime/src/iree/vm/ref.h:223: INVALID_ARGUMENT; ref type mismatch; while invoking native function hal.command_buffer.create; while calling import;
+[ 1] bytecode module.__init:110 -
+[ 0] bytecode module@2:1012 -
+```
+
+Other observed failures from the same repro:
+
+```text
+thread 59 failed:
+iree/runtime/src/iree/vm/ref.h:223: INVALID_ARGUMENT; ref type mismatch; while invoking native function hal.device.query.i64; while calling import;
+[ 0] bytecode module@2:268 -
+```
+
+```text
+thread 17 failed:
+iree/runtime/src/iree/vm/ref.h:223: INVALID_ARGUMENT; ref type mismatch; while invoking native function hal.executable.create; while calling import;
+[ 0] bytecode module@2:990 -
+```
+
+The failure is intermittent. Running the command a few times may be needed.
+
+## Question
+
+Is this usage expected to be supported? If not, what is the intended threading
+and instance ownership model for low-level VM + HAL setup?
