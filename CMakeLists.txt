@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.21...3.24)
 # Project configuration
 #-------------------------------------------------------------------------------
 
-project(iree-template-runtime-cmake VERSION 1.0 LANGUAGES CXX C)
+project(iree-shared-instance-context-repro VERSION 1.0 LANGUAGES CXX C)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 #-------------------------------------------------------------------------------
@@ -70,12 +70,8 @@ endif()
 # integrating it can be useful to drop it.
 add_subdirectory(third_party/iree EXCLUDE_FROM_ALL)
 
-#-------------------------------------------------------------------------------
-# Repro
-#-------------------------------------------------------------------------------
-
-set(_NAME "low_level_multi_instance_hal_repro")
-add_executable(${_NAME} "low_level_multi_instance_hal_repro.c")
-target_compile_options(${_NAME} PRIVATE ${IREE_DEFAULT_COPTS})
 find_package(Threads REQUIRED)
-target_link_libraries(${_NAME} iree_runtime_runtime Threads::Threads)
+
+add_executable(shared_instance_context_repro main.c)
+target_compile_options(shared_instance_context_repro PRIVATE ${IREE_DEFAULT_COPTS})
+target_link_libraries(shared_instance_context_repro iree_runtime_runtime Threads::Threads)
