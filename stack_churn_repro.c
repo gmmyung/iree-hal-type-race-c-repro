@@ -1,13 +1,13 @@
-// Minimal C repro for concurrent low-level VM/HAL execution with one shared
-// iree_vm_instance_t and independent per-thread contexts.
+// Repro for concurrent low-level VM/HAL stack churn:
+//
+//   one shared VM instance
+//   HAL types registered once before spawning threads
+//   each thread repeatedly creates an independent low-level stack
+//   each stack is invoked once and then destroyed
 //
 // Usage:
-//   shared_instance_context_repro local-sync simple_mul.vmfb
-//                                [iterations] [thread_count]
-//
-// The VM instance and HAL type registration are process-wide. Each thread owns
-// its HAL device, HAL module, bytecode module, VM context, function handle, VM
-// lists, and buffer views. No iree_vm_context_t is shared between threads.
+//   low_level_stack_churn_repro local-sync simple_mul.vmfb [iterations]
+//                               [thread_count]
 
 #include <iree/base/api.h>
 #include <iree/hal/api.h>
@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static const iree_hal_dim_t kElementCount = 4;
 
 typedef struct barrier_t {
   pthread_mutex_t mutex;
@@ -93,8 +95,8 @@ static iree_status_t bytecode_file_initialize(const char* path,
     return iree_make_status(IREE_STATUS_NOT_FOUND, "failed to open %s", path);
   }
 
-  uint8_t* data = NULL;
   iree_status_t status = iree_ok_status();
+  uint8_t* data = NULL;
   if (fseek(file, 0, SEEK_END) != 0) {
     status = iree_make_status(IREE_STATUS_INTERNAL, "failed to seek %s", path);
   }
@@ -129,103 +131,94 @@ static iree_status_t bytecode_file_initialize(const char* path,
   return iree_ok_status();
 }
 
-typedef struct thread_session_t {
+typedef struct runtime_stack_t {
   iree_vm_instance_t* instance;
-  iree_hal_driver_registry_t* driver_registry;
+  iree_hal_driver_registry_t* registry;
   iree_hal_driver_t* driver;
   iree_hal_device_t* device;
   iree_vm_module_t* hal_module;
   iree_vm_module_t* bytecode_module;
   iree_vm_context_t* context;
   iree_vm_function_t function;
-} thread_session_t;
+} runtime_stack_t;
 
-static void thread_session_deinitialize(thread_session_t* session) {
-  if (session->context) iree_vm_context_release(session->context);
-  if (session->bytecode_module)
-    iree_vm_module_release(session->bytecode_module);
-  if (session->hal_module) iree_vm_module_release(session->hal_module);
-  if (session->device) iree_hal_device_release(session->device);
-  if (session->driver) iree_hal_driver_release(session->driver);
-  if (session->driver_registry)
-    iree_hal_driver_registry_free(session->driver_registry);
-  if (session->instance) iree_vm_instance_release(session->instance);
-  memset(session, 0, sizeof(*session));
+static void stack_deinitialize(runtime_stack_t* stack) {
+  if (stack->context) iree_vm_context_release(stack->context);
+  if (stack->bytecode_module) iree_vm_module_release(stack->bytecode_module);
+  if (stack->hal_module) iree_vm_module_release(stack->hal_module);
+  if (stack->device) iree_hal_device_release(stack->device);
+  if (stack->driver) iree_hal_driver_release(stack->driver);
+  if (stack->registry) iree_hal_driver_registry_free(stack->registry);
+  if (stack->instance) iree_vm_instance_release(stack->instance);
+  memset(stack, 0, sizeof(*stack));
 }
 
-static iree_status_t thread_session_initialize(
+static iree_status_t stack_initialize(
     iree_vm_instance_t* shared_instance, iree_string_view_t device_uri,
-    iree_const_byte_span_t bytecode_data, thread_session_t* out_session) {
-  memset(out_session, 0, sizeof(*out_session));
+    iree_const_byte_span_t bytecode_data, runtime_stack_t* out_stack) {
+  memset(out_stack, 0, sizeof(*out_stack));
   iree_allocator_t host_allocator = iree_allocator_system();
 
   iree_vm_instance_retain(shared_instance);
-  out_session->instance = shared_instance;
+  out_stack->instance = shared_instance;
 
-  iree_status_t status = iree_hal_driver_registry_allocate(
-      host_allocator, &out_session->driver_registry);
+  iree_status_t status =
+      iree_hal_driver_registry_allocate(host_allocator, &out_stack->registry);
   if (iree_status_is_ok(status)) {
-    status =
-        iree_hal_register_all_available_drivers(out_session->driver_registry);
+    status = iree_hal_register_all_available_drivers(out_stack->registry);
   }
   if (iree_status_is_ok(status)) {
-    status = iree_hal_driver_registry_try_create(out_session->driver_registry,
-                                                 device_uri, host_allocator,
-                                                 &out_session->driver);
+    status = iree_hal_driver_registry_try_create(
+        out_stack->registry, device_uri, host_allocator, &out_stack->driver);
   }
   if (iree_status_is_ok(status)) {
     status = iree_hal_driver_create_default_device(
-        out_session->driver, host_allocator, &out_session->device);
+        out_stack->driver, host_allocator, &out_stack->device);
   }
-
   if (iree_status_is_ok(status)) {
     iree_hal_device_group_t* device_group = NULL;
     status = iree_hal_device_group_create_from_device(
-        out_session->device, host_allocator, &device_group);
+        out_stack->device, host_allocator, &device_group);
     if (iree_status_is_ok(status)) {
       status = iree_hal_module_create(
-          out_session->instance, iree_hal_module_device_policy_default(),
+          out_stack->instance, iree_hal_module_device_policy_default(),
           device_group, IREE_HAL_MODULE_FLAG_SYNCHRONOUS,
-          iree_hal_module_debug_sink_stdio(stderr), host_allocator,
-          &out_session->hal_module);
+          iree_hal_module_debug_sink_null(), host_allocator,
+          &out_stack->hal_module);
     }
     iree_hal_device_group_release(device_group);
   }
-
   if (iree_status_is_ok(status)) {
     status = iree_vm_bytecode_module_create(
-        out_session->instance, IREE_VM_BYTECODE_MODULE_FLAG_NONE, bytecode_data,
-        iree_allocator_null(), host_allocator, &out_session->bytecode_module);
+        out_stack->instance, IREE_VM_BYTECODE_MODULE_FLAG_NONE, bytecode_data,
+        iree_allocator_null(), host_allocator, &out_stack->bytecode_module);
   }
-
   if (iree_status_is_ok(status)) {
-    iree_vm_module_t* modules[2] = {out_session->hal_module,
-                                    out_session->bytecode_module};
+    iree_vm_module_t* modules[2] = {out_stack->hal_module,
+                                    out_stack->bytecode_module};
     status = iree_vm_context_create_with_modules(
-        out_session->instance, IREE_VM_CONTEXT_FLAG_NONE,
-        IREE_ARRAYSIZE(modules), modules, host_allocator,
-        &out_session->context);
+        out_stack->instance, IREE_VM_CONTEXT_FLAG_NONE, IREE_ARRAYSIZE(modules),
+        modules, host_allocator, &out_stack->context);
   }
-
   if (iree_status_is_ok(status)) {
     status = iree_vm_context_resolve_function(
-        out_session->context, iree_make_cstring_view("module.simple_mul"),
-        &out_session->function);
+        out_stack->context, iree_make_cstring_view("module.simple_mul"),
+        &out_stack->function);
   }
 
   if (!iree_status_is_ok(status)) {
-    thread_session_deinitialize(out_session);
+    stack_deinitialize(out_stack);
   }
   return status;
 }
 
-static iree_status_t push_f32_input(thread_session_t* session,
-                                    iree_vm_list_t* inputs,
-                                    const float values[4]) {
-  static const iree_hal_dim_t shape[1] = {4};
+static iree_status_t push_f32_input(runtime_stack_t* stack,
+                                    iree_vm_list_t* inputs, const float* values,
+                                    iree_hal_dim_t element_count) {
+  const iree_hal_dim_t shape[1] = {element_count};
   iree_hal_buffer_view_t* view = NULL;
   iree_status_t status = iree_hal_buffer_view_allocate_buffer_copy(
-      session->device, iree_hal_device_allocator(session->device),
+      stack->device, iree_hal_device_allocator(stack->device),
       IREE_ARRAYSIZE(shape), shape, IREE_HAL_ELEMENT_TYPE_FLOAT_32,
       IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
       (iree_hal_buffer_params_t){
@@ -233,7 +226,7 @@ static iree_status_t push_f32_input(thread_session_t* session,
           .access = IREE_HAL_MEMORY_ACCESS_ALL,
           .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
       },
-      iree_make_const_byte_span(values, sizeof(float) * 4), &view);
+      iree_make_const_byte_span(values, sizeof(float) * element_count), &view);
 
   iree_vm_ref_t ref = iree_vm_ref_null();
   if (iree_status_is_ok(status)) {
@@ -244,8 +237,8 @@ static iree_status_t push_f32_input(thread_session_t* session,
   return status;
 }
 
-static iree_status_t run_simple_mul(thread_session_t* session, int iteration,
-                                    int thread_index) {
+static iree_status_t invoke_once(runtime_stack_t* stack, int thread_index,
+                                 int iteration) {
   iree_allocator_t host_allocator = iree_allocator_system();
   iree_vm_list_t* inputs = NULL;
   iree_vm_list_t* outputs = NULL;
@@ -256,12 +249,30 @@ static iree_status_t run_simple_mul(thread_session_t* session, int iteration,
                                  host_allocator, &outputs);
   }
 
-  const float lhs[4] = {1.0f, 1.1f, 1.2f, 1.3f};
-  const float rhs[4] = {10.0f, 100.0f, 1000.0f, 10000.0f};
-  if (iree_status_is_ok(status)) status = push_f32_input(session, inputs, lhs);
-  if (iree_status_is_ok(status)) status = push_f32_input(session, inputs, rhs);
+  float* lhs = NULL;
+  float* rhs = NULL;
   if (iree_status_is_ok(status)) {
-    status = iree_vm_invoke(session->context, session->function,
+    lhs = calloc((size_t)kElementCount, sizeof(*lhs));
+    rhs = calloc((size_t)kElementCount, sizeof(*rhs));
+    if (!lhs || !rhs) {
+      status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                "failed to allocate input buffers");
+    }
+  }
+  if (iree_status_is_ok(status)) {
+    for (iree_hal_dim_t i = 0; i < kElementCount; ++i) {
+      lhs[i] = (float)i;
+      rhs[i] = (float)i;
+    }
+  }
+  if (iree_status_is_ok(status)) {
+    status = push_f32_input(stack, inputs, lhs, kElementCount);
+  }
+  if (iree_status_is_ok(status)) {
+    status = push_f32_input(stack, inputs, rhs, kElementCount);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_vm_invoke(stack->context, stack->function,
                             IREE_VM_INVOCATION_FLAG_NONE, NULL, inputs, outputs,
                             host_allocator);
   }
@@ -275,22 +286,32 @@ static iree_status_t run_simple_mul(thread_session_t* session, int iteration,
     status = iree_hal_buffer_view_check_deref(result_ref, &result);
   }
   if (iree_status_is_ok(status)) {
-    float result_values[4] = {0};
-    status = iree_hal_device_transfer_d2h(
-        session->device, iree_hal_buffer_view_buffer(result), 0, result_values,
-        sizeof(result_values), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
-        iree_infinite_timeout());
-    if (iree_status_is_ok(status) &&
-        (result_values[0] != 10.0f || result_values[1] != 110.0f ||
-         result_values[2] != 1200.0f || result_values[3] != 13000.0f)) {
-      status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "thread %d iteration %d produced %g %g %g %g",
-                                thread_index, iteration, result_values[0],
-                                result_values[1], result_values[2],
-                                result_values[3]);
+    float* result_values = calloc((size_t)kElementCount, sizeof(*result_values));
+    if (!result_values) {
+      status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                "failed to allocate result buffer");
     }
+    if (iree_status_is_ok(status)) {
+      status = iree_hal_device_transfer_d2h(
+          stack->device, iree_hal_buffer_view_buffer(result), 0, result_values,
+          sizeof(float) * kElementCount, IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+          iree_infinite_timeout());
+    }
+    for (iree_hal_dim_t i = 0; i < kElementCount && iree_status_is_ok(status);
+         ++i) {
+      float expected = (float)(i * i);
+      if (result_values[i] != expected) {
+        status = iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "thread %d iteration %d element %zu produced %g", thread_index,
+            iteration, (size_t)i, result_values[i]);
+      }
+    }
+    free(result_values);
   }
 
+  free(rhs);
+  free(lhs);
   iree_vm_ref_release(&result_ref);
   if (outputs) iree_vm_list_release(outputs);
   if (inputs) iree_vm_list_release(inputs);
@@ -309,34 +330,29 @@ typedef struct thread_args_t {
 
 static void* thread_main(void* raw_args) {
   thread_args_t* args = (thread_args_t*)raw_args;
-  thread_session_t session;
-  memset(&session, 0, sizeof(session));
-
-  args->status = thread_session_initialize(
-      args->shared_instance, args->device_uri, args->bytecode_data, &session);
-
   if (!barrier_wait(args->start_barrier)) {
-    if (iree_status_is_ok(args->status)) {
-      args->status = iree_make_status(IREE_STATUS_CANCELLED, "barrier failed");
-    }
-    thread_session_deinitialize(&session);
+    args->status = iree_make_status(IREE_STATUS_CANCELLED, "barrier failed");
     return NULL;
   }
 
   for (int i = 0; i < args->iterations && iree_status_is_ok(args->status);
        ++i) {
-    args->status = run_simple_mul(&session, i, args->index);
+    runtime_stack_t stack;
+    args->status = stack_initialize(args->shared_instance, args->device_uri,
+                                    args->bytecode_data, &stack);
+    if (iree_status_is_ok(args->status)) {
+      args->status = invoke_once(&stack, args->index, i);
+    }
+    stack_deinitialize(&stack);
   }
-
-  thread_session_deinitialize(&session);
   return NULL;
 }
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr,
-            "usage: shared_instance_context_repro device "
-            "module.vmfb [iterations] [thread_count]\n");
+            "usage: low_level_stack_churn_repro device module.vmfb "
+            "[iterations] [thread_count]\n");
     return 1;
   }
 
@@ -422,8 +438,8 @@ int main(int argc, char** argv) {
 
   if (ret) return ret;
   fprintf(stdout,
-          "completed %d calls on each of %d threads with one shared VM "
-          "instance and independent contexts\n",
+          "completed %d create/invoke/destroy iterations on each of %d "
+          "threads with one shared VM instance\n",
           iterations, thread_count);
   return 0;
 }

@@ -1,19 +1,24 @@
-# IREE Shared Instance / Context Concurrency Repro
+# IREE Concurrent Low-Level VM/HAL Stack Churn Repro
 
 This is a small C repro based on
 [`iree-template-runtime-cmake`](https://github.com/iree-org/iree-template-runtime-cmake).
 
 It stress tests this low-level runtime shape:
 
-1. the process creates one `iree_vm_instance_t`
-2. the process calls `iree_hal_module_register_all_types(instance)` once
-3. each thread retains the shared VM instance
-4. each thread creates its own HAL device, HAL module, bytecode module, VM
-   context, function handle, VM lists, and buffer views
-5. all threads repeatedly invoke the same exported VM function
+1. create one process-wide `iree_vm_instance_t`
+2. call `iree_hal_module_register_all_types(instance)` once
+3. spawn worker threads
+4. in every worker iteration, create a fresh HAL driver/device/module,
+   bytecode module, VM context, function handle, VM lists, and buffer views
+5. invoke once
+6. destroy the whole stack
 
 No `iree_vm_context_t`, `iree_vm_function_t`, `iree_vm_list_t`, or
-`iree_hal_device_t` is shared between threads.
+`iree_hal_device_t` is shared between threads. HAL types are registered once on
+the shared VM instance before spawning worker threads.
+
+This reproduces intermittent aborts while independent per-thread stacks are
+being created, invoked, and destroyed concurrently.
 
 ## Build
 
@@ -21,7 +26,7 @@ No `iree_vm_context_t`, `iree_vm_function_t`, `iree_vm_list_t`, or
 git submodule update --init --recursive third_party/iree
 
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo .
-cmake --build build --target shared_instance_context_repro
+cmake --build build --target low_level_stack_churn_repro
 ```
 
 Compile the sample module with a matching IREE compiler:
@@ -33,22 +38,37 @@ iree-compile \
     -o build/simple_mul.vmfb
 ```
 
-## Run
+The CMake config intentionally enables both the embedded ELF and VMVX executable
+loaders. The repro command below uses the LLVM CPU/embedded ELF VMFB generated
+from `simple_mul.mlir`.
+
+Single-thread stack churn passes:
 
 ```sh
-for i in $(seq 1 20); do
-  echo "run=$i"
-  ./build/shared_instance_context_repro \
-      local-sync build/simple_mul.vmfb 1000 64 || exit $?
-done
+./build/low_level_stack_churn_repro local-sync build/simple_mul.vmfb 1000 1
 ```
 
-On my local machine this C repro currently passes even at higher stress levels:
+The same stack churn usually fails locally with higher thread counts:
 
 ```sh
-./build/shared_instance_context_repro local-sync build/simple_mul.vmfb 1000 64
-./build/shared_instance_context_repro local-sync build/simple_mul.vmfb 500 128
+./build/low_level_stack_churn_repro local-sync build/simple_mul.vmfb 100 16
 ```
 
-This is useful as a reference for checking whether failures seen from higher
-level bindings are caused by IREE itself or by the binding layer.
+Observed failure mode:
+
+```text
+iree/runtime/src/iree/vm/ref.h:223: INVALID_ARGUMENT; ref type mismatch;
+while invoking native function hal.device.query.i64; while calling import;
+
+thread #N, stop reason = signal SIGABRT
+iree_abort
+iree_vm_buffer_deinitialize
+iree_vm_bytecode_module_destroy
+stack_deinitialize
+stack_initialize
+thread_main
+```
+
+In the captured run, other worker threads were concurrently inside
+`iree_vm_context_create_with_modules` and `iree_vm_invoke`, but each thread had
+its own VM context and HAL device.

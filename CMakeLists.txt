@@ -38,11 +38,12 @@ set(IREE_BUILD_SAMPLES OFF)
 # to be built based on available dependencies (CUDA SDK, etc).
 # Users should only include the drivers they actually plan on using to save on
 # compile time and binary size. This sample uses the local synchronous CPU
-# executor and the embedded ELF loader.
+# executor with embedded ELF and VMVX loaders enabled.
 set(IREE_HAL_DRIVER_DEFAULTS OFF)
 set(IREE_HAL_DRIVER_LOCAL_SYNC ON)
 set(IREE_HAL_EXECUTABLE_LOADER_DEFAULTS OFF)
 set(IREE_HAL_EXECUTABLE_LOADER_EMBEDDED_ELF ON)
+set(IREE_HAL_EXECUTABLE_LOADER_VMVX_MODULE ON)
 
 # The CMake variant specified will change some runtime behavior such as
 # including asserts in Debug builds. There's a group of features commonly used
@@ -72,6 +73,6 @@ add_subdirectory(third_party/iree EXCLUDE_FROM_ALL)
 
 find_package(Threads REQUIRED)
 
-add_executable(shared_instance_context_repro main.c)
-target_compile_options(shared_instance_context_repro PRIVATE ${IREE_DEFAULT_COPTS})
-target_link_libraries(shared_instance_context_repro iree_runtime_runtime Threads::Threads)
+add_executable(low_level_stack_churn_repro stack_churn_repro.c)
+target_compile_options(low_level_stack_churn_repro PRIVATE ${IREE_DEFAULT_COPTS})
+target_link_libraries(low_level_stack_churn_repro iree_runtime_runtime Threads::Threads)
